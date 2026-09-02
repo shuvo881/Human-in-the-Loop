@@ -1,86 +1,56 @@
-"""
-Chat -> draft -> review/revise loop -> approve -> final.
-
-Flow:
-    START -> generate -> review -> (approve)  -> final -> END
-                            ^          |
-                            |     (feedback)
-                            +---- revise <-------+
-
-Same logic as before, just with the dead/duplicate `client` imports removed
-(neither `http.client` nor `xmlrpc.client` was actually used — the code
-calls `llm.invoke(...)`).
-"""
-
-from typing import Literal, Optional, TypedDict
-
+from langgraph.graph.message import add_messages
+import sqlite3
+from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
+from langgraph.checkpoint.sqlite import SqliteSaver
+from typing import Dict, Literal, Optional, TypedDict
+from langchain.messages import AIMessage, AnyMessage, HumanMessage
+from typing_extensions import Annotated
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from pathlib import Path
 
 from llm import llm
 
+def file_paths_reducer(left: list[str], right: list[str]) -> list[str]:
+    """Validate new file paths and merge them with the existing state."""
+    valid_paths = []
+    for path in right:
+        p = Path(path)
+        if p.exists() and p.is_file():
+            valid_paths.append(str(p))
+    return left + valid_paths if valid_paths else left
 
-class ChatState(TypedDict):
-    question: str
-    draft: str
-    feedback: Optional[str]
-    status: Literal["drafting", "in_review", "approved"]
-
-
-def generate_node(state: ChatState) -> dict:
-    """First pass: ask the model to answer the question."""
-    resp = llm.invoke([{"role": "user", "content": state["question"]}])
-    return {"draft": resp.content, "status": "in_review"}
-
-
-def review_node(state: ChatState) -> Command[Literal["revise", "final"]]:
-    """Pause and show the draft to the human for approval or feedback."""
-    result = interrupt(
-        {
-            "instruction": "Approve this answer, or send feedback to revise it.",
-            "draft": state["draft"],
-        }
-    )
-    # print(f"review_node: result={result}")
-    # Expect result like {"decision": "approve"} or
-    # {"decision": "revise", "feedback": "make it shorter"}
-    if result.get("decision") == "approve":
-        return Command(goto="final")
-    return Command(goto="revise", update={"feedback": result.get("feedback", "")})
+class FileInfo(TypedDict):
+    path: Annotated[str, file_paths_reducer]
+    file_type: Optional[str]
+    company_name: Optional[str]
 
 
-def revise_node(state: ChatState) -> dict:
-    """Send the previous draft + human feedback back to the model."""
-    resp = llm.invoke(
-        [
-            {"role": "user", "content": state["question"]},
-            {"role": "assistant", "content": state["draft"]},
-            {
-                "role": "user",
-                "content": f"Please revise your previous answer. Feedback: {state['feedback']}",
-            },
-        ]
-    )
-    return {"draft": resp.content, "status": "in_review"}
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    status: Literal["draft", "review", "approved", "rejected"]
+    file_paths: Annotated[list[str], file_paths_reducer]
+    related_files_info: list[FileInfo]
+    features: Optional[dict]
 
 
-def final_node(state: ChatState) -> dict:
-    return {"status": "approved"}
+
+def node(state: State):
+    new_message = AIMessage("Hello!")
+    return {"messages": [new_message], "status": "draft", "file_paths": ['test2.txt'], "related_files_info": [{"path": "test2.txt", "file_type": "text", "company_name": "Example Corp"}]}
+
+builder = StateGraph(State).add_node(node).add_edge(START, "node")
+checkpointer = SqliteSaver(sqlite3.connect("checkpoint.db", check_same_thread=False))
+# store = SqliteSaver(sqlite3.connect("store.db", check_same_thread=False))
+graph = builder.compile(checkpointer=checkpointer,)
 
 
-def build_graph_builder() -> StateGraph:
-    """Returns an uncompiled builder so the caller can attach whatever
-    checkpointer it wants (sync SqliteSaver for a script, AsyncSqliteSaver
-    for FastAPI, etc.)."""
-    builder = StateGraph(ChatState)
-    builder.add_node("generate", generate_node)
-    builder.add_node("review", review_node)
-    builder.add_node("revise", revise_node)
-    builder.add_node("final", final_node)
+config = {"configurable": {"thread_id": '12345', }}
+result = graph.invoke({"messages": [HumanMessage("Hi")], "file_paths": ["./test.txt"], "related_files_info": [{"path": "./related.txt"}]}, config=config)
 
-    builder.add_edge(START, "generate")
-    builder.add_edge("generate", "review")
-    # review routes to "revise" or "final" itself via Command(goto=...)
-    builder.add_edge("revise", "review")
-    builder.add_edge("final", END)
-    return builder
+print("Result:", result)
+
+for message in result["messages"]:
+    message.pretty_print()
+
+print(graph.get_state(config))
